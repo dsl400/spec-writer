@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m unittest discover -s tools/ste -p 'test_*.py'
+      - run: python3 -m unittest discover -s skills/spec-writer/tools/ste -p 'test_*.py'
       - name: Write the version of the tag into the skill
-        run: sed -i "0,/^  version: .*/s//  version: ${GITHUB_REF_NAME#v}/" SKILL.md && grep -q "^  version: ${GITHUB_REF_NAME#v}$" SKILL.md
+        run: sed -i "0,/^  version: .*/s//  version: ${GITHUB_REF_NAME#v}/" skills/spec-writer/SKILL.md && grep -q "^  version: ${GITHUB_REF_NAME#v}$" skills/spec-writer/SKILL.md
       - name: Pack the skill
-        run: tar -czf spec-writer.tar.gz --transform 's,^,spec-writer/,' SKILL.md README.md tools/ste/ste-check tools/ste/wordset.json tools/ste/wordset-LICENSE
+        run: tar -czf spec-writer.tar.gz -C skills --exclude='test_*' --exclude=__pycache__ spec-writer
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" spec-writer.tar.gz SKILL.md --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" spec-writer.tar.gz skills/spec-writer/SKILL.md --title "$GITHUB_REF_NAME" --generate-notes

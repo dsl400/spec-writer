@@ -6,10 +6,10 @@ requirements and RFC 2119 obligation words, and checks each file with the
 
 ## Contents
 
-- `SKILL.md` — the skill.
-- `tools/ste/ste-check` — the ASD-STE100 checker. It reads `wordset.json`
+- `skills/spec-writer/SKILL.md` — the skill.
+- `skills/spec-writer/tools/ste/ste-check` — the ASD-STE100 checker. It reads `wordset.json`
   next to it and `<workspace>/docs/project-terms.txt`.
-- `tools/ste/test_ste_check.py` — the tests of the checker.
+- `skills/spec-writer/tools/ste/test_ste_check.py` — the tests of the checker.
 
 ## Install
 
@@ -24,13 +24,14 @@ gh release download --repo dsl400/spec-writer --pattern spec-writer.tar.gz -O - 
 Or from the source:
 
 ```sh
-git clone git@github.com:dsl400/spec-writer.git ~/.claude/skills/spec-writer
+git clone git@github.com:dsl400/spec-writer.git
+ln -s "$PWD/spec-writer/skills/spec-writer" ~/.claude/skills/spec-writer
 ```
 
-For one project only, clone it into `<project>/.claude/skills/spec-writer`.
+For one project only, link it into `<project>/.claude/skills/spec-writer`.
 
 ## Test
 
 ```sh
-python3 -m pytest tools/ste
+python3 -m pytest skills/spec-writer/tools/ste
 ```
