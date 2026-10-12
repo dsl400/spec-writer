@@ -15,7 +15,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 -m unittest discover -s skills/spec-writer/tools/ste -p 'test_*.py'
       - name: Write the version of the tag into the skill
-        run: sed -i "0,/^  version: .*/s//  version: ${GITHUB_REF_NAME#v}/" skills/spec-writer/SKILL.md && grep -q "^  version: ${GITHUB_REF_NAME#v}$" skills/spec-writer/SKILL.md
+        run: |
+          sed -i "0,/^  version: .*/s//  version: ${GITHUB_REF_NAME#v}/" skills/spec-writer/SKILL.md && grep -q "^  version: ${GITHUB_REF_NAME#v}$" skills/spec-writer/SKILL.md
       - name: Pack the skill
         run: tar -czf spec-writer.tar.gz -C skills --exclude='test_*' --exclude=__pycache__ spec-writer
       - name: Create the release
