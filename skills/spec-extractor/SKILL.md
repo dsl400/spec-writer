@@ -116,7 +116,7 @@ Tests and issues name a rule by its number, so a number stays with its rule.
 
 When the research shows a defect or a missing function, the spec states what
 the code does and the gap goes to
-`<workspace>/.reports/application-gaps/<module>-gaps.md`. `<module>` is the
+`<workspace>/reports/application-gaps/<module>-gaps.md`. `<module>` is the
 top folder under `docs/specs/`.
 
 | Category | When | Labels |
@@ -169,7 +169,7 @@ START:
   JUMP  FILE IF yes
   DO    read the routes, templates, component code, and server handlers of the screen
   DO    write the parent file when it is absent, then one file for each screen and each dialog
-  DO    add each gap to .reports/application-gaps/<module>-gaps.md the moment you find it
+  DO    add each gap to reports/application-gaps/<module>-gaps.md the moment you find it
 CHECK_STE:
   ADD   1 to <s>
   STOP  show the errors of ste-check and ask the human how to continue IF <s> >= 4
