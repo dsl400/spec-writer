@@ -1,0 +1,24 @@
+# Publishes the spec-writer skill as a GitHub release asset when a v* tag is pushed.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tools/ste -p 'test_*.py'
+      - name: Write the version of the tag into the skill
+        run: sed -i "0,/^  version: .*/s//  version: ${GITHUB_REF_NAME#v}/" SKILL.md && grep -q "^  version: ${GITHUB_REF_NAME#v}$" SKILL.md
+      - name: Pack the skill
+        run: tar -czf spec-writer.tar.gz --transform 's,^,spec-writer/,' SKILL.md README.md tools/ste/ste-check tools/ste/wordset.json tools/ste/wordset-LICENSE
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" spec-writer.tar.gz SKILL.md --title "$GITHUB_REF_NAME" --generate-notes

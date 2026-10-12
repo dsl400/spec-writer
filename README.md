@@ -13,6 +13,16 @@ requirements and RFC 2119 obligation words, and checks each file with the
 
 ## Install
 
+Each release holds `spec-writer.tar.gz`. Its `SKILL.md` names the source
+repository and the version of the release (`metadata.source`,
+`metadata.version`); the release workflow writes the version from the tag.
+
+```sh
+gh release download --repo dsl400/spec-writer --pattern spec-writer.tar.gz -O - | tar -xz -C ~/.claude/skills
+```
+
+Or from the source:
+
 ```sh
 git clone git@github.com:dsl400/spec-writer.git ~/.claude/skills/spec-writer
 ```

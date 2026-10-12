@@ -2,6 +2,9 @@
 name: spec-writer
 description: Use when the user asks to write, change, or review a specification (specificație) under docs/reference/. Writes each requirement in EARS with RFC 2119 obligation words, in ASD-STE100, and checks each file with the ste-check tool that comes with this skill.
 user-invocable: true
+metadata:
+  source: https://github.com/dsl400/spec-writer
+  version: 0.1.0
 ---
 
 # Spec Writer
