@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""ste-check — validate a document against ASD-STE100 Simplified Technical English.
+
+Usage: ste-check <file.md> [<file.md> ...] [--json] [--no-vocab]
+
+Reports one finding per line: path:line:col — RULE — message
+
+Rule numbers refer to ASD-STE100 Issue 8 (2021-04-30) Part 1 writing rules.
+Only rules with a deterministic textual test are implemented; see README.md.
+"""
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+# The approved words of ASD-STE100. It ships with the tool and no workspace
+# edits it.
+WORDSET = Path(__file__).parent / "wordset.json"
+
+# STE rule 1.6 permits an unapproved word when it is a technical name. A
+# technical name serves one project, so each workspace owns its own list at
+# docs/project-terms.txt. --workspace names the root that holds it, because a
+# tool that reads the working directory answers differently from each folder,
+# and an agent has the least predictable working directory here.
+PROJECT_TERMS = "docs/project-terms.txt"
+
+# Severity reflects how certain the textual test is, not how important the rule
+# is. An error has an unambiguous test and a mechanical fix. A warning needs a
+# human to confirm it, because the tool reads part of speech from a lookup
+# table and reads sentence boundaries from punctuation alone.
+SEVERITY = {
+    "8.1": "error",    # a semicolon is a character match
+    "4.2": "error",    # a contraction is a character match
+    "GR-6": "error",   # a Latin abbreviation is a character match
+    "5.1": "error",    # word count against a fixed threshold
+    "6.3": "error",    # word count against a fixed threshold
+    "6.6": "error",    # sentence count against a fixed threshold
+    "3.4": "error",    # a helping verb before a participle
+    "3.6": "warning",  # a predicate adjective reads as passive
+    "3.5": "warning",  # an unlisted "-ing" noun reads as a verb
+    "2.1": "warning",  # cluster length depends on the part of speech
+    "5.2": "warning",  # a coordinated verb depends on the part of speech
+    # An unapproved word has a dictionary answer, and project-terms.txt holds
+    # each technical name the dictionary lacks. A warning here reached exit
+    # code 0, so the rule that says "run until it exits 0" blocked nothing.
+    "1.6": "error",
+}
+
+# Markdown constructs that carry no prose: fenced code, inline code, links to
+# bare URLs, HTML tags, headings markers, list bullets, table pipes.
+FENCE = re.compile(r"^\s*(```|~~~)")
+INLINE_CODE = re.compile(r"`[^`]*`")
+MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+HTML_TAG = re.compile(r"<[^>]+>")
+# An HTML entity ends in a semicolon that is syntax rather than punctuation.
+HTML_ENTITY = re.compile(r"&(?:[a-zA-Z]+|#[0-9]+);")
+LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+HEADING = re.compile(r"^\s*#{1,6}\s+")
+
+# STE 3.4: helping verbs that build complex tenses. "be"/"have" as the only
+# verb are approved; these forms are flagged only before a participle.
+HELPERS = {"is", "are", "was", "were", "be", "been", "being",
+           "has", "have", "had", "will", "would", "shall", "should",
+           "may", "might", "can", "could", "must", "do", "does", "did"}
+PASSIVE_BE = {"is", "are", "was", "were", "be", "been", "being"}
+
+# Irregular past participles that do not end in -ed.
+IRREGULAR_PP = {
+    "done", "gone", "seen", "taken", "given", "made", "found", "held", "kept",
+    "left", "lost", "met", "paid", "put", "read", "run", "said", "sent", "set",
+    "shown", "shut", "sold", "told", "written", "known", "grown", "drawn",
+    "blown", "broken", "chosen", "driven", "eaten", "fallen", "forgotten",
+    "frozen", "hidden", "risen", "spoken", "stolen", "worn", "built", "burnt",
+    "cut", "hit", "let", "shot", "split", "spread", "thrown", "understood",
+    "brought", "bought", "caught", "taught", "thought", "got", "become",
+}
+
+LATIN_ABBR = {"e.g.", "i.e.", "etc.", "vs.", "cf.", "et al.", "n.b.", "viz."}
+
+# Words ending in "-ing" that are nouns or pronouns, not verb forms. The
+# wordset omits most of them, so rule 3.5 needs them listed explicitly.
+ING_NOT_VERB = {
+    "everything", "something", "nothing", "anything", "during", "morning",
+    "evening", "ceiling", "warning", "bearing", "wiring", "housing", "casing",
+    "coupling", "fitting", "setting", "reading", "heading", "opening",
+    "meaning", "string", "spring", "ring", "wing", "thing", "king", "being",
+    "engineering", "training", "drawing", "building", "clothing", "lightning",
+}
+
+# File paths, URLs, and identifiers carry no prose.
+PATHISH = re.compile(r"(?:[~./]|\b[a-z]+://)[\w./~@:-]*[\w/-]|\b\w+\.(?:md|py|json|ya?ml|txt|html|js|ts|sh|toml|cfg|ini)\b")
+
+CONTRACTION = re.compile(
+    r"\b\w+(?:'(?:s|t|re|ve|ll|d|m)|n't)\b|\b(?:can't|won't|shan't)\b", re.I)
+
+SENT_SPLIT = re.compile(r"(?<=[.!?:])\s+")
+
+# STE 8.1: the semicolon is the one banned punctuation mark.
+SEMICOLON = re.compile(r";")
+
+ARTICLES = {"a", "an", "the", "this", "these", "that", "those", "such",
+            "other", "another", "same", "many", "much", "more", "most",
+            "few", "several", "own", "only", "just", "also", "then", "thus",
+            "its", "his", "her", "their", "our", "your", "my", "no", "any",
+            "each", "every", "all", "some", "both", "one", "two", "three",
+            "four", "five", "six", "seven", "eight", "nine", "ten"}
+
+
+# Irregular forms of approved verbs. The wordset lists only the base form,
+# and no ending rule reaches "made" from "make".
+IRREGULAR_BASE = {
+    "has": "have", "had": "have", "does": "do", "did": "do", "done": "do",
+    "made": "make", "known": "know", "knew": "know", "shown": "show",
+    "gave": "give", "given": "give", "got": "get", "went": "go",
+    "gone": "go", "kept": "keep", "found": "find", "sent": "send",
+    "told": "tell", "wrote": "write", "written": "write", "chose": "choose",
+    "chosen": "choose", "took": "take", "taken": "take", "saw": "see",
+    "seen": "see", "held": "hold", "left": "leave", "began": "begin",
+    "begun": "begin", "came": "come", "became": "become", "ran": "run",
+    "hid": "hide", "hidden": "hide", "broke": "break", "broken": "break",
+    "fell": "fall", "fallen": "fall", "brought": "bring", "caught": "catch",
+    "built": "build", "stood": "stand", "understood": "understand",
+}
+
+# STE counts a number as one word, and a number word is that number.
+NUMBER_WORDS = {"two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten", "hundred", "thousand"}
+
+
+def base_forms(word):
+    """Yield the word and the base forms an ending can inflect from.
+
+    The wordset lists only the base form, so "covers", "removed" and
+    "stopped" must reach the entries for "cover", "remove" and "stop".
+    """
+    yield word
+    if word in IRREGULAR_BASE:
+        yield IRREGULAR_BASE[word]
+    if word.endswith("ies") and len(word) > 4:
+        yield word[:-3] + "y"
+    if word.endswith(("ses", "xes", "zes", "ches", "shes")):
+        yield word[:-2]
+    if word.endswith("s") and not word.endswith("ss"):
+        yield word[:-1]
+    for ending in ("ed", "ing"):
+        if word.endswith(ending) and len(word) > len(ending) + 2:
+            stem = word[:-len(ending)]
+            yield stem
+            yield stem + "e"
+            if stem.endswith("i"):
+                yield stem[:-1] + "y"
+            if len(stem) > 2 and stem[-1] == stem[-2]:
+                yield stem[:-1]
+
+
+def find_workspace(files):
+    """The first folder above a file checked that holds the terms of a
+    workspace.
+
+    The file under test names its own workspace, so the tool reports the same
+    findings from each working directory. A tool that reads the working
+    directory answers differently from each folder.
+    """
+    for f in files:
+        here = Path(f).resolve().parent
+        for d in (here, *here.parents):
+            if (d / PROJECT_TERMS).exists():
+                return d
+    return None
+
+
+def load_wordset(workspace=None):
+    """The approved words, plus the technical names of one workspace."""
+    if not WORDSET.exists():
+        return None
+    data = json.loads(WORDSET.read_text())
+    approved, unapproved, pos = set(), set(), {}
+    for w in data.get("words", []):
+        t = w["title"].lower()
+        if w["wordstatus"] == "approved":
+            approved.add(t)
+        else:
+            unapproved.add(t)
+        pos.setdefault(t, w.get("spacypos", ""))
+    alts = {}
+    for a in data.get("alternatives", []):
+        alts.setdefault(a["title"].lower(), []).append(a["alt_title"])
+    project = set()
+    terms = Path(workspace or ".") / PROJECT_TERMS
+    if terms.exists():
+        for line in terms.read_text().split("\n"):
+            term = line.split("#")[0].strip().lower()
+            if term:
+                project.add(term)
+    return {"approved": approved, "unapproved": unapproved,
+            "pos": pos, "alts": alts, "project": project}
+
+
+def strip_markdown(line):
+    """Return the prose content of a markdown line, preserving column offsets."""
+    out = INLINE_CODE.sub(lambda m: " " * len(m.group(0)), line)
+    out = MD_LINK.sub(lambda m: m.group(1).ljust(len(m.group(0))), out)
+    out = HTML_TAG.sub(lambda m: " " * len(m.group(0)), out)
+    out = HTML_ENTITY.sub(lambda m: " " * len(m.group(0)), out)
+    out = PATHISH.sub(lambda m: " " * len(m.group(0)), out)
+    m = HEADING.match(out)
+    if m:
+        out = " " * m.end() + out[m.end():]
+    m = LIST_MARK.match(out)
+    if m:
+        out = " " * m.end() + out[m.end():]
+    return out
+
+
+def prose_lines(text):
+    """Yield (lineno, prose_text) for lines outside fenced code blocks."""
+    lines = text.split("\n")
+    # A document opens with a YAML front matter block, which holds keys and
+    # values rather than sentences. `description:` carries prose, so the block
+    # keeps that one key and drops the rest.
+    start, in_front = 0, False
+    if lines and lines[0].strip() == "---":
+        for j in range(1, len(lines)):
+            if lines[j].strip() in ("---", "..."):
+                start, in_front = j + 1, True
+                break
+    in_fence = False
+    for i, raw in enumerate(lines, start=1):
+        if in_front and i <= start:
+            if re.match(r"\s*description\s*:", raw):
+                yield i, strip_markdown(re.sub(r"^\s*description\s*:", "", raw))
+            continue
+        if FENCE.match(raw):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        stripped = raw.strip()
+        # Front matter delimiters and table separator rows carry no prose.
+        if stripped in ("---", "...") or re.fullmatch(r"[\s|:-]+", stripped or "x"):
+            continue
+        yield i, strip_markdown(raw)
+
+
+def words_of(s):
+    """Tokenize into (word, offset) pairs, keeping hyphenated words whole."""
+    return [(m.group(0), m.start())
+            for m in re.finditer(r"[A-Za-z][A-Za-z'-]*", s)]
+
+
+def count_ste_words(sentence):
+    """STE 8.5-8.7: parenthesized text, numbers, units, hyphenated words
+    and quoted text each count as one word."""
+    s = re.sub(r"\([^)]*\)", " X ", sentence)
+    s = re.sub(r"\"[^\"]*\"", " X ", s)
+    s = re.sub(r"\b\d[\d.,/:-]*\s*[A-Za-z]*\b", " X ", s)
+    return len(re.findall(r"[A-Za-z][A-Za-z'-]*|X", s))
+
+
+class Checker:
+    def __init__(self, path, text, vocab=None):
+        self.path = path
+        self.text = text
+        self.vocab = vocab
+        self.findings = []
+
+    def add(self, line, col, rule, msg):
+        self.findings.append({"file": str(self.path), "line": line,
+                              "col": col + 1, "rule": rule,
+                              "severity": SEVERITY.get(rule, "warning"),
+                              "message": msg})
+
+    def run(self):
+        lines = list(prose_lines(self.text))
+        self.check_lines(lines)
+        self.check_sentences(lines)
+        self.check_paragraphs()
+        return self.findings
+
+    def check_lines(self, lines):
+        for ln, s in lines:
+            for m in SEMICOLON.finditer(s):
+                self.add(ln, m.start(), "8.1",
+                         "Semicolon is not approved. Write two sentences.")
+            for m in CONTRACTION.finditer(s):
+                if "'" in m.group(0) and re.search(r"'s\b", m.group(0)):
+                    continue  # possessive, not a contraction
+                self.add(ln, m.start(), "4.2",
+                         f'Contraction "{m.group(0)}". Write the full form.')
+            low = s.lower()
+            for abbr in LATIN_ABBR:
+                idx = low.find(abbr)
+                if idx >= 0:
+                    self.add(ln, idx, "GR-6",
+                             f'Latin abbreviation "{abbr}". '
+                             "Write the English equivalent.")
+            self.check_noun_cluster(ln, s)
+            self.check_verbs(ln, s)
+            if self.vocab:
+                self.check_vocab(ln, s)
+
+    def tag_of(self, word):
+        """Return the wordset part of speech for a word, or a guess from its
+        ending when the wordset omits it."""
+        lw = word.lower()
+        for form in base_forms(lw):
+            if form in self.vocab["pos"]:
+                return self.vocab["pos"][form]
+        return "ADV" if lw.endswith(("ly", "ed", "ing")) else "NOUN"
+
+    def used_as_noun(self, toks, i):
+        """True when the token at index i occupies a noun position: after an
+        article or an adjective, or before a verb or a full stop."""
+        prev = toks[i - 1][0].lower() if i > 0 else ""
+        if prev in ARTICLES:
+            return True
+        nxt = toks[i + 1][0].lower() if i + 1 < len(toks) else ""
+        # An article opens the object of a verb: "the user clicks the button".
+        if nxt in ("a", "an", "the"):
+            return False
+        # A noun follows an adjective, and it also follows another noun inside
+        # a technical name ("config file", "log level").
+        if prev and (prev in self.vocab["project"] or
+                     self.tag_of(prev) in ("ADJ", "NOUN", "PROPN")):
+            return True
+        return nxt in HELPERS
+
+    def used_as_verb(self, toks, i):
+        """True when the token at index i occupies a verb position.
+
+        The wordset stores one part of speech for each word, so a word listed
+        only as an unapproved noun ("hold", "state", "place") reads as a
+        finding where it works as a verb. A relative pronoun, a noun, or a
+        helper before it marks that position.
+        """
+        # An adverb between the subject and the verb leaves the verb position
+        # where it was: "the system also closes".
+        p = i - 1
+        if p > 0 and toks[p][0].lower() in ("also", "then", "only", "always",
+                                             "still", "again", "immediately"):
+            p -= 1
+        prev = toks[p][0].lower() if p >= 0 else ""
+        if prev in ("that", "which", "who", "it", "they", "we", "you", "i"):
+            return True
+        if prev in HELPERS:
+            return True
+        # "the directories that hold code" — a noun before the word, and a
+        # noun after it, is the shape of a subject, a verb, and an object.
+        if prev and self.tag_of(prev) in ("NOUN", "PROPN"):
+            nxt = toks[i + 1][0].lower() if i + 1 < len(toks) else ""
+            return bool(nxt) and nxt not in HELPERS
+        return False
+
+    def check_noun_cluster(self, ln, s):
+        """STE 2.1: no noun cluster of more than three words.
+
+        Approximated as four or more consecutive capitalized-or-lowercase
+        words with no article, preposition, or verb between them, anchored
+        by a following noun-ish token.
+        """
+        if not self.vocab or s.strip().startswith("|"):
+            return
+        # A comma, a full stop, or any other punctuation ends a noun cluster;
+        # only unbroken word sequences form one.
+        run, start, prev_end = [], None, 0
+        for w, off in words_of(s) + [("", len(s))]:
+            lw = w.lower()
+            if run and re.search(r"[^\sA-Za-z'-]", s[prev_end:off]):
+                if len(run) > 3:
+                    self.add(ln, start, "2.1",
+                             f'Noun cluster of {len(run)} words: '
+                             f'"{" ".join(run)}". Write three words or fewer.')
+                run, start = [], None
+            prev_end = off + len(w)
+            # An unknown word is assumed to be a technical name (a noun); an
+            # adverb or a participle ends the cluster rather than extending it.
+            tag = self.tag_of(lw) if w else "ADV"
+            nounish = (w and lw not in ARTICLES and lw not in HELPERS and
+                       tag in ("NOUN", "PROPN", "ADJ"))
+            if nounish:
+                if start is None:
+                    start = off
+                run.append(w)
+                continue
+            if len(run) > 3:
+                self.add(ln, start, "2.1",
+                         f'Noun cluster of {len(run)} words: "{" ".join(run)}". '
+                         "Write three words or fewer.")
+            run, start = [], None
+
+    def check_verbs(self, ln, s):
+        toks = words_of(s)
+        for i, (w, off) in enumerate(toks):
+            lw = w.lower()
+            if lw in PASSIVE_BE and i + 1 < len(toks):
+                nxt = toks[i + 1][0].lower()
+                # Skip an intervening adverb.
+                j = i + 1
+                if nxt.endswith("ly") and j + 1 < len(toks):
+                    j += 1
+                    nxt = toks[j][0].lower()
+                # A participle followed by a noun modifies that noun; it does
+                # not form a passive clause ("are fenced code blocks").
+                after = toks[j + 1][0].lower() if j + 1 < len(toks) else ""
+                modifies_noun = bool(after) and after not in HELPERS and \
+                    self.vocab is not None and \
+                    any(f in self.vocab["pos"] and
+                        self.vocab["pos"][f] in ("NOUN", "PROPN")
+                        for f in base_forms(after))
+                if (nxt.endswith("ed") or nxt in IRREGULAR_PP) and \
+                        nxt not in ARTICLES and not modifies_noun:
+                    self.add(ln, off, "3.6",
+                             f'Passive voice "{w} {toks[j][0]}". '
+                             "Name the actor and write the active voice.")
+                    continue
+            if lw in HELPERS and lw not in PASSIVE_BE and i + 1 < len(toks):
+                nxt = toks[i + 1][0].lower()
+                if nxt.endswith("ing") or nxt in ("been", "have", "be"):
+                    self.add(ln, off, "3.4",
+                             f'Complex verb structure "{w} {toks[i + 1][0]}". '
+                             "Write the simple present, past, or imperative.")
+            if lw.endswith("ing") and len(lw) > 5 and i > 0:
+                prev = toks[i - 1][0].lower()
+                if prev in ARTICLES or prev in HELPERS:
+                    continue
+                if lw in ING_NOT_VERB:
+                    continue
+                if self.vocab and self.vocab["pos"].get(lw) in (
+                        "NOUN", "PRON", "PROPN", "ADJ", "ADP"):
+                    continue
+                self.add(ln, off, "3.5",
+                         f'"{w}" as a verb form. Use "-ing" only in a '
+                         "technical name.")
+
+    def check_vocab(self, ln, s):
+        toks = words_of(s)
+        for i, (w, off) in enumerate(toks):
+            lw = w.lower().strip("-'")
+            if not lw or lw in NUMBER_WORDS:
+                continue
+            # A word joined to a digit ("R12", "S3") is an identifier, not a
+            # word of the dictionary.
+            end = off + len(w)
+            if end < len(s) and s[end].isdigit():
+                continue
+            forms = list(base_forms(lw))
+            if any(f in self.vocab["approved"] or f in self.vocab["project"]
+                   for f in forms):
+                continue
+            entry = next((f for f in forms if f in self.vocab["unapproved"]), None)
+            # The wordset stores one part of speech per word, so a word listed
+            # only as an unapproved verb ("file", "code", "work") must pass
+            # when it occupies a noun position. STE rule 1.6 permits it there
+            # as a technical name.
+            if entry and self.vocab["pos"].get(entry) == "VERB" and \
+                    self.used_as_noun(toks, i):
+                continue
+            # The same asymmetry in the other direction: a word listed only as
+            # an unapproved noun ("hold", "place") is approved as a verb.
+            if entry and self.vocab["pos"].get(entry) in ("NOUN", "ADV", "ADJ") and \
+                    self.used_as_verb(toks, i):
+                continue
+            if entry:
+                alts = [a for a in self.vocab["alts"].get(entry, [])
+                        if a.lower() != entry]
+                hint = f' Approved alternative: {", ".join(alts[:3])}.' if alts else ""
+                self.add(ln, off, "1.6",
+                         f'"{w}" is not approved.{hint}')
+                continue
+            # STE approves only the words of its dictionary. A word it lacks is
+            # a technical name of the project, or a word to replace.
+            self.add(ln, off, "1.6",
+                     f'"{w}" is not in the STE dictionary. If it names a thing '
+                     f"of this project, add it to {PROJECT_TERMS}.")
+
+    def check_sentences(self, lines):
+        for ln, s in lines:
+            text = s.strip()
+            if not text:
+                continue
+            if text.startswith("|"):
+                continue  # a table row holds cell fragments, not sentences
+            for sent in SENT_SPLIT.split(text):
+                sent = sent.strip()
+                if not sent:
+                    continue
+                n = count_ste_words(sent)
+                # STE 5.1 caps instructions at 20 words, 6.3 caps descriptive
+                # sentences at 25. An imperative opening marks an instruction.
+                first = (words_of(sent) or [("", 0)])[0][0].lower()
+                imperative = bool(first) and first not in ARTICLES and \
+                    first not in HELPERS and not first.endswith("ly")
+                limit = 20 if imperative else 25
+                rule = "5.1" if imperative else "6.3"
+                if n > limit:
+                    col = s.find(sent)
+                    self.add(ln, max(col, 0), rule,
+                             f"Sentence of {n} words. Write {limit} words or fewer.")
+                if imperative and re.search(r"\b(and|then)\b\s+\w+", sent, re.I):
+                    verbs = re.findall(r"\b(?:and|then)\s+([a-z]+)\b", sent, re.I)
+                    if any(v.lower() in self.vocab["approved"] and
+                           self.vocab["pos"].get(v.lower()) == "VERB"
+                           for v in verbs) if self.vocab else False:
+                        col = s.find(sent)
+                        self.add(ln, max(col, 0), "5.2",
+                                 "Two instructions in one sentence. "
+                                 "Write one instruction per sentence.")
+
+    def check_paragraphs(self):
+        """STE 6.6: no paragraph has more than six sentences.
+
+        It reads the lines `prose_lines` yields, so the front matter and a
+        fenced block reach this rule the same way they reach each other rule.
+        """
+        prose = dict(prose_lines(self.text))
+        para, start = [], None
+        for i, raw in enumerate(self.text.split("\n"), start=1):
+            if i in prose and raw.strip():
+                if start is None:
+                    start = i
+                para.append((prose[i].strip(), raw))
+            else:
+                self.flush_paragraph(para, start)
+                para, start = [], None
+        self.flush_paragraph(para, start)
+
+    def flush_paragraph(self, para, start):
+        if not para or start is None:
+            return
+        # A run of XML elements is a list, and each element states one rule.
+        # Rule 6.6 counts the sentences of a paragraph of prose.
+        if sum(1 for _, raw in para if raw.lstrip().startswith("<")) > len(para) / 2:
+            return
+        # A numbered or bulleted list is a procedure, and rule 5.1 already caps
+        # each item. Rule 6.6 counts a paragraph, so a list of eight steps is
+        # not a paragraph of eight sentences.
+        if any(LIST_MARK.match(raw) for _, raw in para):
+            return
+        joined = " ".join(prose for prose, _ in para if prose)
+        sents = [x for x in SENT_SPLIT.split(joined) if x.strip()]
+        if len(sents) > 6:
+            self.add(start, 0, "6.6",
+                     f"Paragraph of {len(sents)} sentences. "
+                     "Write six sentences or fewer.")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Validate a document against ASD-STE100 Issue 8.")
+    ap.add_argument("files", nargs="+", type=Path)
+    ap.add_argument("--json", action="store_true", dest="as_json",
+                    help="emit findings as JSON")
+    ap.add_argument("--no-vocab", action="store_true",
+                    help="skip the approved-word dictionary check (rule 1.6)")
+    ap.add_argument("--structure", action="store_true",
+                    help="report the structural rules only: sentence length, "
+                         "voice, verb form, clusters, punctuation")
+    ap.add_argument("--rule", action="append",
+                    help="report only these rule numbers")
+    ap.add_argument("--errors-only", action="store_true",
+                    help="report the rules with an unambiguous test, and set "
+                         "the exit code from those alone")
+    ap.add_argument("--workspace", metavar="DIR", default=None,
+                    help="the root that holds docs/project-terms.txt "
+                         "(default: the first folder above the file checked "
+                         "that holds one)")
+    args = ap.parse_args()
+
+    workspace = args.workspace or find_workspace(args.files)
+    # The check serves the documents of docs/ alone. A file of a different
+    # folder follows a different style, and its findings are noise.
+    docs = (Path(workspace or ".") / "docs").resolve()
+    for f in args.files:
+        if docs not in f.resolve().parents:
+            print(f"error: {f} is not in {docs}", file=sys.stderr)
+            return 2
+    # docs/tmp.md is the journal of the workspace, a log of work rather than
+    # a document.
+    journal = docs / "tmp.md"
+    args.files = [f for f in args.files if f.resolve() != journal]
+
+    vocab = None if args.no_vocab else load_wordset(workspace)
+    if vocab is None and not args.no_vocab:
+        print(f"warning: {WORDSET} not found; vocabulary check skipped",
+              file=sys.stderr)
+
+    all_findings = []
+    for f in args.files:
+        if not f.exists():
+            print(f"error: {f} not found", file=sys.stderr)
+            return 2
+        all_findings += Checker(f, f.read_text(), vocab).run()
+
+    if args.structure:
+        all_findings = [x for x in all_findings if x["rule"] != "1.6"]
+    if args.errors_only:
+        all_findings = [x for x in all_findings if x["severity"] == "error"]
+    if args.rule:
+        keep = set(args.rule)
+        all_findings = [x for x in all_findings if x["rule"] in keep]
+
+    all_findings.sort(key=lambda x: (x["file"], x["line"], x["col"]))
+    errors = [x for x in all_findings if x["severity"] == "error"]
+
+    if args.as_json:
+        print(json.dumps(all_findings, indent=2))
+    else:
+        for x in all_findings:
+            print(f"{x['file']}:{x['line']}:{x['col']} — {x['severity']} — "
+                  f"STE {x['rule']} — {x['message']}")
+        n, e = len(all_findings), len(errors)
+        print(f"\n{e} error{'s' if e != 1 else ''}, "
+              f"{n - e} warning{'s' if n - e != 1 else ''}"
+              f" in {len(args.files)} file{'s' if len(args.files) != 1 else ''}",
+              file=sys.stderr)
+    # The exit code reports errors alone, so a loop that iterates until the
+    # tool succeeds terminates on the unambiguous findings.
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
